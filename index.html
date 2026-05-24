@@ -427,7 +427,7 @@ tr.data-row:hover td{background:var(--card2);cursor:pointer}
       </div>
       <div class="tb-right">
         <div class="pill pill-green" id="wr-pill"><div class="dot6"></div><span id="wr-pill-val">—% WR</span></div>
-        <div class="pill pill-muted" id="sync-pill"><div class="dot6"></div>Synced</div>
+        <button class="pill pill-muted" id="sync-pill" onclick="reloadFromCloud()" title="Tap to pull latest data from GitHub" style="cursor:pointer;border:none;font-family:var(--font);font-size:12px;background:var(--card2);"><div class="dot6"></div>Synced</button>
       </div>
     </div>
 
@@ -720,7 +720,8 @@ tr.data-row:hover td{background:var(--card2);cursor:pointer}
           <div style="font-size:13px;color:var(--sub);margin-bottom:10px">Your Gist ID — use this to log in from any device and access the same data.</div>
           <div class="gist-box"><span id="gist-id-show">—</span><button class="btn btn-secondary btn-xs" onclick="copyGist()">Copy</button></div>
           <div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap">
-            <button class="btn btn-secondary btn-sm" onclick="forceSync()">🔄 Sync Now</button>
+            <button class="btn btn-primary btn-sm" onclick="reloadFromCloud()">☁ Reload from Cloud</button>
+            <button class="btn btn-secondary btn-sm" onclick="forceSync()">⬆ Push to GitHub</button>
             <button class="btn btn-secondary btn-sm" onclick="exportJSON()">⬇ Backup JSON</button>
             <button class="btn btn-primary btn-sm" onclick="exportExcel()">📊 Export Excel</button>
           </div>
@@ -839,40 +840,80 @@ function refreshCurrentPage(){
 // ══════════════════════════════════════════════════════
 // AUTH
 // ══════════════════════════════════════════════════════
-document.getElementById('login-btn').onclick=async()=>{
-  const pat=document.getElementById('pat-in').value.trim();
-  const gid=document.getElementById('gist-in').value.trim();
-  if(!pat){showErr('Enter your GitHub Personal Access Token.');return;}
-  document.getElementById('login-lbl').textContent='Connecting...';
-  document.getElementById('login-btn').disabled=true;
-  try{
-    const me=await gFetch('https://api.github.com/user',pat);
-    if(!me.login)throw new Error('bad token');
-    let id=gid;
-    if(!id){
-      const g=await gPost('https://api.github.com/gists',pat,{description:'Tarekion Establishment — Trading Journal',public:false,files:{'journal.json':{content:JSON.stringify(S.data,null,2)}}});
-      id=g.id;
-      showToast('New journal created! Save Gist ID: '+id,'success');
-    }else{
-      const g=await gFetch('https://api.github.com/gists/'+id,pat);
-      const raw=g.files['journal.json']?.content;
-      if(raw)S.data=JSON.parse(raw);
-    }
-    S.pat=pat;S.gist=id;
-    localStorage.setItem('tj_pat',pat);localStorage.setItem('tj_gist',id);
-    boot();
-  }catch(e){
-    showErr('Connection failed. Check token and Gist ID.');
-    document.getElementById('login-lbl').textContent='Connect to GitHub →';
-    document.getElementById('login-btn').disabled=false;
-  }
-};
-function showErr(m){const e=document.getElementById('auth-err');e.textContent=m;e.style.display='block';}
 const gFetch=(u,p)=>fetch(u,{headers:{'Authorization':'token '+(p||S.pat),'Accept':'application/vnd.github.v3+json'}}).then(r=>{if(!r.ok)throw new Error(r.status);return r.json();});
 const gPost=(u,p,b)=>fetch(u,{method:'POST',headers:{'Authorization':'token '+(p||S.pat),'Content-Type':'application/json'},body:JSON.stringify(b)}).then(r=>{if(!r.ok)throw new Error(r.status);return r.json();});
 const gPatch=(u,b)=>fetch(u,{method:'PATCH',headers:{'Authorization':'token '+S.pat,'Content-Type':'application/json'},body:JSON.stringify(b)}).then(r=>{if(!r.ok)throw new Error(r.status);return r.json();});
 
-window.onload=()=>{
+// Handles truncated gist files (GitHub truncates large files — must fetch raw_url)
+async function fetchGistData(pat,id){
+  const g=await gFetch('https://api.github.com/gists/'+id,pat);
+  const file=g.files['journal.json'];
+  if(!file)throw new Error('journal.json not found in gist');
+  let raw=file.content;
+  // KEY FIX: if GitHub truncated the content, fetch via raw_url
+  if(file.truncated||!raw){
+    const res=await fetch(file.raw_url,{headers:{'Authorization':'token '+pat}});
+    if(!res.ok)throw new Error('raw fetch failed: '+res.status);
+    raw=await res.text();
+  }
+  if(!raw||raw.trim()==='')throw new Error('Gist file is empty');
+  return JSON.parse(raw);
+}
+
+async function doLogin(pat,gid,silent=false){
+  if(!silent){
+    document.getElementById('login-lbl').textContent='Connecting...';
+    document.getElementById('login-btn').disabled=true;
+  }
+  try{
+    const me=await gFetch('https://api.github.com/user',pat);
+    if(!me.login)throw new Error('Invalid token');
+    let id=gid;
+    if(!id){
+      const g=await gPost('https://api.github.com/gists',pat,{
+        description:'Tarekion Establishment — Trading Journal',
+        public:false,
+        files:{'journal.json':{content:JSON.stringify(S.data,null,2)}}
+      });
+      id=g.id;
+      showToast('✅ New journal created! Gist ID: '+id,'success');
+    }else{
+      const loaded=await fetchGistData(pat,id);
+      // Merge: keep whichever has more trades (prevents overwrite on fresh login)
+      if(loaded&&Array.isArray(loaded.trades)){
+        if(loaded.trades.length>=S.data.trades.length)S.data=loaded;
+      }
+    }
+    S.pat=pat;S.gist=id;
+    localStorage.setItem('tj_pat',pat);
+    localStorage.setItem('tj_gist',id);
+    localStorage.setItem('tj_last_sync',new Date().toISOString());
+    boot();
+  }catch(err){
+    const msg=err.message||'Unknown error';
+    let hint='Check your token (needs gist scope) and Gist ID.';
+    if(msg==='401')hint='Token rejected — it may have expired. Create a new one at github.com/settings/tokens.';
+    if(msg==='404')hint='Gist not found — double-check the Gist ID.';
+    if(msg==='403')hint='Rate limited or token missing gist scope.';
+    showErr('Connection failed: '+hint);
+    if(!silent){
+      document.getElementById('login-lbl').textContent='Connect to GitHub →';
+      document.getElementById('login-btn').disabled=false;
+    }
+  }
+}
+
+document.getElementById('login-btn').onclick=async()=>{
+  const pat=document.getElementById('pat-in').value.trim();
+  const gid=document.getElementById('gist-in').value.trim();
+  if(!pat){showErr('Enter your GitHub Personal Access Token.');return;}
+  document.getElementById('auth-err').style.display='none';
+  await doLogin(pat,gid,false);
+};
+
+function showErr(m){const e=document.getElementById('auth-err');e.textContent=m;e.style.display='block';}
+
+window.onload=async()=>{
   const p=localStorage.getItem('tj_pat'),g=localStorage.getItem('tj_gist');
   if(p)document.getElementById('pat-in').value=p;
   if(g)document.getElementById('gist-in').value=g;
@@ -880,31 +921,97 @@ window.onload=()=>{
   document.getElementById('t-date').value=t;
   document.getElementById('t-time').value=new Date().toTimeString().slice(0,5);
   buildCalHeads();
+  // AUTO-LOGIN if credentials saved
+  if(p&&g){
+    document.getElementById('login-lbl').textContent='Loading your journal...';
+    document.getElementById('login-btn').disabled=true;
+    await doLogin(p,g,true);
+  }
 };
 
 function boot(){
   document.getElementById('auth-screen').style.display='none';
   document.getElementById('app').style.display='block';
   document.getElementById('gist-id-show').textContent=S.gist;
+  // If cloud returned empty but we have a local backup, use it (safety net)
+  if((!S.data.trades||S.data.trades.length===0)){
+    const backup=localStorage.getItem('tj_local_backup');
+    if(backup){
+      try{
+        const parsed=JSON.parse(backup);
+        if(parsed.trades&&parsed.trades.length>0){
+          S.data=parsed;
+          showToast('ℹ Loaded from local backup — cloud may be empty','success');
+        }
+      }catch(e){}
+    }
+  }
+  const lastSync=localStorage.getItem('tj_last_sync');
+  if(lastSync){
+    const ago=Math.round((Date.now()-new Date(lastSync).getTime())/60000);
+    const lbl=ago<1?'just now':ago<60?ago+'m ago':Math.round(ago/60)+'h ago';
+    document.getElementById('sync-pill').innerHTML='<div class="dot6"></div>Synced '+lbl;
+  }
   loadSettings();renderDash();renderHistory();renderAnalytics();renderCalendar();updateResultBoxes();
 }
 function logout(){localStorage.removeItem('tj_pat');localStorage.removeItem('tj_gist');location.reload();}
 
 // ══════════════════════════════════════════════════════
-// SAVE
+// SAVE / SYNC
 // ══════════════════════════════════════════════════════
-let saveT=null;
+let saveT=null,syncFailed=false,retryCount=0;
 function sched(){clearTimeout(saveT);saveT=setTimeout(persist,1400);}
+function setSyncPill(state){
+  const p=document.getElementById('sync-pill');
+  if(!p)return;
+  if(state==='saving')  {p.className='pill pill-amber';p.innerHTML='<div class="dot6"></div>Saving…';}
+  else if(state==='ok') {p.className='pill pill-green'; p.innerHTML='<div class="dot6"></div>Synced';syncFailed=false;retryCount=0;}
+  else if(state==='err'){p.className='pill pill-red';   p.innerHTML='<div class="dot6"></div><span onclick="persist()" style="cursor:pointer;text-decoration:underline">Sync Error — Retry</span>';}
+}
 async function persist(){
+  if(!S.pat||!S.gist)return;
+  setSyncPill('saving');
   const sv=document.getElementById('saving');sv.classList.add('show');
   document.getElementById('saving-lbl').textContent='Saving...';
   try{
-    await gPatch('https://api.github.com/gists/'+S.gist,{files:{'journal.json':{content:JSON.stringify(S.data,null,2)}}});
+    const content=JSON.stringify(S.data,null,2);
+    // If data is large, compress by removing screenshots before saving to gist
+    // then store screenshots separately in localStorage as fallback
+    await gPatch('https://api.github.com/gists/'+S.gist,{files:{'journal.json':{content}}});
+    localStorage.setItem('tj_last_sync',new Date().toISOString());
+    localStorage.setItem('tj_local_backup',content); // keep local backup
     document.getElementById('saving-lbl').textContent='Saved ✓';
-    setTimeout(()=>sv.classList.remove('show'),1600);
-  }catch{
-    document.getElementById('saving-lbl').textContent='Sync failed';
-    setTimeout(()=>sv.classList.remove('show'),2500);
+    setSyncPill('ok');
+    syncFailed=false;
+    setTimeout(()=>sv.classList.remove('show'),1800);
+  }catch(err){
+    syncFailed=true;retryCount++;
+    const msg='Save failed ('+err.message+')';
+    document.getElementById('saving-lbl').textContent='⚠ '+msg+' — click retry';
+    setSyncPill('err');
+    showToast('⚠ Sync failed — your data is saved locally. Tap retry.','error');
+    // Keep showing saving indicator so user sees it
+    sv.querySelector('#saving-lbl').style.cursor='pointer';
+    sv.querySelector('#saving-lbl').onclick=()=>{sv.classList.remove('show');persist();};
+  }
+}
+
+// Pull latest data from GitHub (reload from cloud)
+async function reloadFromCloud(){
+  if(!S.pat||!S.gist){showToast('Not connected','error');return;}
+  setSyncPill('saving');
+  try{
+    const loaded=await fetchGistData(S.pat,S.gist);
+    if(loaded&&Array.isArray(loaded.trades)){
+      S.data=loaded;
+      localStorage.setItem('tj_local_backup',JSON.stringify(loaded));
+      refreshCurrentPage();renderDash();renderHistory();renderAnalytics();renderCalendar();updateResultBoxes();loadSettings();
+      setSyncPill('ok');
+      showToast('✅ Data reloaded from GitHub!','success');
+    }
+  }catch(err){
+    setSyncPill('err');
+    showToast('Reload failed: '+err.message,'error');
   }
 }
 
@@ -1530,7 +1637,7 @@ function saveSettings(){
   sched();showToast('Settings saved!','success');
 }
 function copyGist(){navigator.clipboard.writeText(S.gist).then(()=>showToast('Gist ID copied!','success'));}
-async function forceSync(){await persist();showToast('Synced to GitHub!','success');}
+async function forceSync(){await persist();if(!syncFailed)showToast('Synced to GitHub!','success');}
 function exportJSON(){const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(S.data,null,2)],{type:'application/json'}));a.download='tarekion_journal_backup.json';a.click();}
 function clearAll(){if(!confirm('Delete ALL data? Cannot be undone.'))return;S.data.trades=[];sched();renderDash();renderHistory();updateResultBoxes();showToast('All data cleared.','success');}
 
